@@ -1,0 +1,172 @@
+nome : RDP
+sobre :
+  workflow_dispatch :
+
+empregos :
+  secure-rdp :
+    executa em : windows-latest
+    tempo limite em minutos : 3600
+
+    passos :
+      # ─────────────────────────────────────────────
+      # 1. LIBERAR ESPACIO E MONTAR DISCO EXTRA
+      # ─────────────────────────────────────────────
+      - Nome : Liberar espaço e montar disco extra
+        executar : |
+          Write-Host "=== Disco antes da limpeza ===" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+          $toRemove = @(
+            "$env:SystemDrive\hostedtoolcache\windows\Ruby",
+            "$env:SystemDrive\hostedtoolcache\windows\go",
+            "$env:SystemDrive\hostedtoolcache\windows\Python",
+            "$env:ProgramFiles\dotnet",
+            "$env:ProgramFiles\MongoDB",
+            "$env:ProgramFiles\PostgreSQL",
+            "$env:ProgramFiles (x86)\Google\Chrome",
+            "$env:ProgramFiles\Mozilla Firefox"
+          )
+          foreach ($path in $toRemove) {
+            se (Caminho de teste $caminho) {
+              Remover-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Removido: $path" -ForegroundColor Verde
+            }
+          }
+          Write-Host "=== Informações do Disco D: ===" -ForegroundColor Cyan
+          Get-PSDrive D -ErrorAction SilentlyContinue
+          $vhdPath = "D:\extra_disk.vhdx"
+          Novo-VHD -Caminho $vhdPath -Tamanho em bytes 100GB -Dinâmico -Ação de erro Continuar silenciosamente
+          Montar-VHD -Caminho $vhdPath
+          $disk = Get-Disk | Where-Object { $_.OperationalStatus -eq 'Online' -and $_.PartitionStyle -eq 'RAW' } | Select-Object -Last 1
+          se ($disco) {
+            Inicializar-Disco -Número $disk.Número -EstiloDePartição MBR -PassThru |
+              Nova-Partição -AtribuirLetraDeUnidade -UsarTamanhoMáximo |
+              Format-Volume -FileSystem NTFS -NewFileSystemLabel "ExtraDisk" -Confirm:$false
+          }
+          Write-Host "=== Disco após a configuração ===" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+          "EXTRA_DISK=E:" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "STORAGE_ROOT=D:\storage" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Novo-Item -TipoItem Diretório -Forçar -Caminho "D:\armazenamento" | Saída-Nulo
+      # ─────────────────────────────────────────────
+      # 3. CONFIGURAR RDP
+      # ─────────────────────────────────────────────
+      - nome : Configurar configurações de RDP
+        executar : |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+            -Nome "fDenyTSConnections" -Valor 0 -Forçar
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+            -Nome "UserAuthentication" -Valor 0 -Forçar
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+            -Nome "SecurityLayer" -Valor 0 -Forçar
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall adicionar regra nome="RDP-Tailscale" `
+            dir=em ação=permitir protocolo=TCP porta local=3389
+          Reiniciar-Serviço -Nome TermService -Forçar
+          Write-Host "RDP configurado." -ForegroundColor Verde
+      # ─────────────────────────────────────────────
+      # 4. CRIAR USUÁRIO RDP
+      # ─────────────────────────────────────────────
+      - nome : Criar usuário RDP
+        executar : |
+          $charSet = @{
+            Upper = [char[]](65..90)
+            Lower = [char[]](97..122)
+            Número = [char[]](48..57)
+            Especial = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $senha = -join ($senhaRaw | Sort-Object { Get-Random })
+          $senhaSegura = ConverterParaStringSegura $senha -ComoTextoSimples -Forçar
+          Novo-UsuárioLocal -Nome "RDP" -Senha $senhaSegura -ContaNuncaExpira -AçãoDeErro ContinuarSilenciosamente
+          Adicionar-MembroDoGrupoLocal -Grupo "Administradores" -Membro "RDP" -AçãoDeErro ContinuarSilenciosamente
+          Adicionar-MembroDoGrupoLocal -Grupo "Usuários da Área de Trabalho Remota" -Membro "RDP" -AçãoDeErro ContinuarSilenciosamente
+          se (-não (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "Falha na criação do usuário"; exit 1
+          }
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Usuário RDP criado." -ForegroundColor Verde
+      # ─────────────────────────────────────────────
+      # 5. INSTALADOR DE ESCAMAS DE CAUDA
+      # ─────────────────────────────────────────────
+      - nome : Instalar Tailscale
+        executar : |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Iniciar-Processo msiexec.exe -ArgumentList "/i","`"$installer`"","/quiet","/norestart" -Wait
+          Remover item $installer -Forçar
+      # ─────────────────────────────────────────────
+      # 6. CONECTAR TAILSCALE
+      # ─────────────────────────────────────────────
+      - nome : Conectar Escama de Cauda
+        executar : |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          enquanto (-não $tsIP -e $retries -lt 15) {
+            Iniciar-Dormir -Segundos 4
+            $tsIP = & $ts ip -4 2>$null
+            $retentativas++
+          }
+          if (-not $tsIP) { Write-Error "IP do Tailscale não atribuído."; exit 1 }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "IP do Tailscale: $tsIP" -ForegroundColor Verde
+      # ─────────────────────────────────────────────
+      # 7. VERIFICAR RDP
+      # ─────────────────────────────────────────────
+      - nome : Verificar RDP
+        executar : |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          se (-não $test.TcpTestSucceeded) {
+            Write-Error "Porta RDP 3389 inacessível"; exit 1
+          }
+          Write-Host "RDP acessível na porta 3389 ✓" -ForegroundColor Verde
+      # ─────────────────────────────────────────────
+      # 8. VERIFICAR APLICAÇÕES INSTALADAS
+      # ─────────────────────────────────────────────
+      - nome : Verificar aplicativos instalados
+        executar : |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║ RELATÓRIO DE VERIFICAÇÃO ║" -ForegroundColor Cyan
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          
+          Write-Host "║ NODE.JS:" -NoNewline
+          try { node --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║ NPM: " -NoNewline
+          try { npm --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "╚═══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+      # ─────────────────────────────────────────────
+      # 9. MANTER A SESsão Ativa
+      # ─────────────────────────────────────────────
+      - nome : Manter ativo e exibir credenciais
+        executar : |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║ INFORMAÇÕES DE ACESSO RDP ║" -ForegroundColor Cyan
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║ IP: $env:TAILSCALE_IP"
+          Write-Host "║ Usuário: RDP"
+          Write-Host "║ Senha: $env:RDP_PASSWORD"
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║ ARMAZENAMENTO ║" -ForegroundColor Cyan
+          Write-Host "║ C: ~14GB (sistema) ║"
+          Write-Host "║ D: ~70GB (disco do executor) ║"
+          Write-Host "║ E: ~100GB (VHD extra) ║"
+          Write-Host "╚═══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+          # Manter a sessão ativa
+          $i = 0
+          enquanto ($verdadeiro) {
+            Iniciar-Dormir -Segundos 60
+            $i++
+            Write-Host "Mantenha-se ativo... ($i minutos)" -ForegroundColor DarkGray
+          }
